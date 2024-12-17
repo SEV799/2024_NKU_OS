@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <unistd.h>
+#include <cow.h>
 
 /* ------------- process/thread mechanism design&implementation -------------
 (an simplified Linux process/thread mechanism )
@@ -83,6 +84,7 @@ void forkrets(struct trapframe *tf);
 void switch_to(struct context *from, struct context *to);
 
 // alloc_proc - alloc a proc_struct and init all fields of proc_struct
+// 申请一个proc_struct结构体，并初始化
 static struct proc_struct *
 alloc_proc(void) {
     struct proc_struct *proc = kmalloc(sizeof(struct proc_struct));
@@ -103,6 +105,11 @@ alloc_proc(void) {
      *       uint32_t flags;                             // Process flag
      *       char name[PROC_NAME_LEN + 1];               // Process name
      */
+        memset(proc, 0, sizeof(struct proc_struct));//初始化proc_struct结构体
+
+        proc->state = PROC_UNINIT;
+        proc->pid = -1;
+        proc->cr3 = boot_cr3;//进程的页目录表
 
      //LAB5 YOUR CODE : (update LAB4 steps)
      /*
@@ -207,6 +214,17 @@ proc_run(struct proc_struct *proc) {
         *   switch_to():              Context switching between two processes
         */
 
+        bool intr_flag;
+        local_intr_save(intr_flag);
+
+        struct proc_struct *prev = current;
+        struct proc_struct *next = proc;
+
+        current = proc;
+        lcr3(proc->cr3);
+        switch_to(&(prev->context), &(next->context));
+
+        local_intr_restore(intr_flag);
     }
 }
 
@@ -297,6 +315,7 @@ put_pgdir(struct mm_struct *mm) {
 }
 
 // copy_mm - process "proc" duplicate OR share process "current"'s mm according clone_flags
+//         - 处理进程的内存空间
 //         - if clone_flags & CLONE_VM, then "share" ; else "duplicate"
 static int
 copy_mm(uint32_t clone_flags, struct proc_struct *proc) {
@@ -395,6 +414,43 @@ do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf) {
     //    6. call wakeup_proc to make the new child process RUNNABLE
     //    7. set ret vaule using child proc's pid
 
+    proc = alloc_proc();//分配一个proc_struct
+    
+    if (proc == NULL) {
+        goto fork_out;
+    }
+
+    proc->parent = current;
+
+    if (setup_kstack(proc) != 0) {
+        goto bad_fork_cleanup_kstack;
+    }
+
+    if (copy_mm(clone_flags, proc) != 0) {
+        goto bad_fork_cleanup_proc;
+    }
+    //if (cow_copy_mm(proc) != 0){
+    //	goto bad_fork_cleanup_proc;
+    //}
+
+    copy_thread(proc, stack, tf);
+
+    bool intr_flag;
+    local_intr_save(intr_flag);
+    
+    proc->pid = get_pid();
+    hash_proc(proc);
+    // list_add(&proc_list, &(proc->list_link));
+    // nr_process++;
+    set_links(proc);
+
+    local_intr_restore(intr_flag);
+
+    wakeup_proc(proc);
+
+    ret = proc->pid;
+
+
     //LAB5 YOUR CODE : (update LAB4 steps)
     //TIPS: you should modify your written code in lab4(step1 and step5), not add more code.
    /* Some Functions
@@ -469,6 +525,7 @@ do_exit(int error_code) {
 }
 
 /* load_icode - load the content of binary program(ELF format) as the new content of current process
+- 加载二进制程序的内容（ELF格式）作为当前进程的新内容
  * @binary:  the memory addr of the content of binary program
  * @size:  the size of the content of binary program
  */
@@ -480,7 +537,7 @@ load_icode(unsigned char *binary, size_t size) {
 
     int ret = -E_NO_MEM;
     struct mm_struct *mm;
-    //(1) create a new mm for current process
+    //(1) create a new mm for current process - 为当前进程创建一个新的mm
     if ((mm = mm_create()) == NULL) {
         goto bad_mm;
     }
@@ -590,11 +647,11 @@ load_icode(unsigned char *binary, size_t size) {
     current->cr3 = PADDR(mm->pgdir);
     lcr3(PADDR(mm->pgdir));
 
-    //(6) setup trapframe for user environment
+    //(6) setup trapframe for user environment - 设置用户环境的trapframe
     struct trapframe *tf = current->tf;
     // Keep sstatus
     uintptr_t sstatus = tf->status;
-    memset(tf, 0, sizeof(struct trapframe));
+    memset(tf, 0, sizeof(struct trapframe));//清空trapframe
     /* LAB5:EXERCISE1 YOUR CODE
      * should set tf->gpr.sp, tf->epc, tf->status
      * NOTICE: If we set trapframe correctly, then the user level process can return to USER MODE from kernel. So
@@ -603,7 +660,11 @@ load_icode(unsigned char *binary, size_t size) {
      *          tf->status should be appropriate for user program (the value of sstatus)
      *          hint: check meaning of SPP, SPIE in SSTATUS, use them by SSTATUS_SPP, SSTATUS_SPIE(defined in risv.h)
      */
-
+    tf->gpr.sp = USTACKTOP;
+    tf->epc = elf->e_entry;
+    // Set SPP to 0 so that we return to user mode
+    // Set SPIE to 1 so that we can handle interrupts
+    tf->status = (sstatus & ~SSTATUS_SPP) | SSTATUS_SPIE;
 
     ret = 0;
 out:
@@ -619,6 +680,7 @@ bad_mm:
 }
 
 // do_execve - call exit_mmap(mm)&put_pgdir(mm) to reclaim memory space of current process
+// - 调用exit_mmap（mm）和put_pgdir（mm）来回收当前进程的内存空间
 //           - call load_icode to setup new memory space accroding binary prog.
 int
 do_execve(const char *name, size_t len, unsigned char *binary, size_t size) {
@@ -636,11 +698,11 @@ do_execve(const char *name, size_t len, unsigned char *binary, size_t size) {
 
     if (mm != NULL) {
         cputs("mm != NULL");
-        lcr3(boot_cr3);
-        if (mm_count_dec(mm) == 0) {
-            exit_mmap(mm);
-            put_pgdir(mm);
-            mm_destroy(mm);
+        lcr3(boot_cr3); // switch to kernel page table
+        if (mm_count_dec(mm) == 0) { // if this process is the last user of this mm
+            exit_mmap(mm); // release all memory of this process
+            put_pgdir(mm); // release PDT
+            mm_destroy(mm); // release mm
         }
         current->mm = NULL;
     }
@@ -651,7 +713,7 @@ do_execve(const char *name, size_t len, unsigned char *binary, size_t size) {
     set_proc_name(current, local_name);
     return 0;
 
-execve_exit:
+execve_exit: // fail
     do_exit(ret);
     panic("already exit: %e.\n", ret);
 }
@@ -697,7 +759,7 @@ repeat:
             }
         }
     }
-    if (haskid) {
+    if (haskid) {//如果有子进程，且子进程不是僵尸进程，那么就让当前进程睡眠，等待子进程退出
         current->state = PROC_SLEEPING;
         current->wait_state = WT_CHILD;
         schedule();
@@ -865,4 +927,3 @@ cpu_idle(void) {
         }
     }
 }
-
